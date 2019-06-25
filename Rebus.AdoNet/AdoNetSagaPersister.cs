@@ -10,6 +10,7 @@ using Newtonsoft.Json;
 using Rebus.Logging;
 using Rebus.Serialization;
 using Rebus.AdoNet.Schema;
+using Rebus.AdoNet.Dialects;
 
 namespace Rebus.AdoNet
 {
@@ -18,7 +19,7 @@ namespace Rebus.AdoNet
 	/// </summary>
 	public class AdoNetSagaPersister : IStoreSagaData, AdoNetSagaPersisterFluentConfigurer, ICanUpdateMultipleSagaDatasAtomically
 	{
-		private const int MaximumSagaDataTypeNameLength = 40;
+		private const int MaximumSagaDataTypeNameLength = 80;
 		private const string SAGA_ID_COLUMN = "id";
 		private const string SAGA_TYPE_COLUMN = "saga_type";
 		private const string SAGA_DATA_COLUMN = "data";
@@ -37,7 +38,8 @@ namespace Rebus.AdoNet
 		private readonly string sagaIndexTableName;
 		private readonly string sagaTableName;
 		private readonly string idPropertyName;
-		private readonly bool useSagaLocking;
+		private bool useSagaLocking;
+		private bool useNoWaitSagaLocking;
 		private bool indexNullProperties = true;
 		private Func<Type, string> sagaNameCustomizer = null;
 
@@ -50,13 +52,12 @@ namespace Rebus.AdoNet
 		/// Constructs the persister with the ability to create connections to database using the specified connection string.
 		/// This also means that the persister will manage the connection by itself, closing it when it has stopped using it.
 		/// </summary>
-		public AdoNetSagaPersister(AdoNetUnitOfWorkManager manager, string sagaTableName, string sagaIndexTableName, bool useSagaLocking)
+		public AdoNetSagaPersister(AdoNetUnitOfWorkManager manager, string sagaTableName, string sagaIndexTableName)
 		{
 			this.manager = manager;
 			this.sagaTableName = sagaTableName;
 			this.sagaIndexTableName = sagaIndexTableName;
 			this.idPropertyName = Reflect.Path<ISagaData>(x => x.Id);
-			this.useSagaLocking = useSagaLocking;
 		}
 
 		/// <summary>
@@ -65,6 +66,13 @@ namespace Rebus.AdoNet
 		public AdoNetSagaPersisterFluentConfigurer DoNotIndexNullProperties()
 		{
 			indexNullProperties = false;
+			return this;
+		}
+
+		public AdoNetSagaPersisterFluentConfigurer UseLockingOnSagaUpdates(bool waitForLocks)
+		{
+			useSagaLocking = true;
+			useNoWaitSagaLocking = !waitForLocks;
 			return this;
 		}
 
@@ -108,7 +116,7 @@ namespace Rebus.AdoNet
 							Columns = new []
 							{
 								new AdoNetColumn() { Name = SAGA_ID_COLUMN, DbType = DbType.Guid },
-								new AdoNetColumn() { Name = SAGA_TYPE_COLUMN, DbType = DbType.StringFixedLength, Length = 40 },
+								new AdoNetColumn() { Name = SAGA_TYPE_COLUMN, DbType = DbType.StringFixedLength, Length = 80 },
 								new AdoNetColumn() { Name = SAGA_REVISION_COLUMN, DbType = DbType.Int32 },
 								new AdoNetColumn() { Name = SAGA_DATA_COLUMN, DbType = DbType.String, Length = 1073741823}
 							},
@@ -126,7 +134,7 @@ namespace Rebus.AdoNet
 							Name = sagaIndexTableName,
 							Columns = new []
 							{
-								new AdoNetColumn() { Name = SAGAINDEX_TYPE_COLUMN, DbType = DbType.StringFixedLength, Length = 40 },
+								new AdoNetColumn() { Name = SAGAINDEX_TYPE_COLUMN, DbType = DbType.StringFixedLength, Length = 80 },
 								new AdoNetColumn() { Name = SAGAINDEX_KEY_COLUMN, DbType = DbType.StringFixedLength, Length = 200  },
 								new AdoNetColumn() { Name = SAGAINDEX_VALUE_COLUMN, DbType = DbType.StringFixedLength, Length = 200 },
 								new AdoNetColumn() { Name = SAGAINDEX_ID_COLUMN, DbType = DbType.Guid }
@@ -567,11 +575,11 @@ namespace Rebus.AdoNet
 		{
 			var dialect = scope.Dialect;
 
-			if (dialect.SupportsTableExpressions && dialect.SupportsReturningClause)
+			if (dialect.SupportsTableExpressions && dialect.SupportsReturningClause && dialect.SupportsOnConflictClause)
 			{
 				DeclareIndexUsingTableExpressions(sagaData, scope, propertiesToIndex);
 			}
-			else if (dialect.SupportsReturningClause)
+			else if (dialect.SupportsReturningClause && dialect.SupportsOnConflictClause)
 			{
 				DeclareIndexUsingReturningClause(sagaData, scope, propertiesToIndex);
 			}
@@ -622,6 +630,18 @@ namespace Rebus.AdoNet
 			}
 		}
 
+		private string GetSagaLockingClause(SqlDialect dialect)
+		{
+			if (useSagaLocking)
+			{
+				return useNoWaitSagaLocking
+					? $"{dialect.SelectForUpdateClause} {dialect.SelectForNoWaitClause}"
+					: dialect.SelectForUpdateClause;
+			}
+
+			return string.Empty;
+		}
+
 		public TSagaData Find<TSagaData>(string sagaDataPropertyPath, object fieldFromMessage) where TSagaData : class, ISagaData
 		{
 			// FIXME: Skip filtering by saga-data, and instead let deserialization try to match returned data to TSagaData. (pruiz)
@@ -632,9 +652,15 @@ namespace Rebus.AdoNet
 				var connection = scope.Connection;
 				var sagaType = GetSagaTypeName(typeof(TSagaData));
 
-				if (useSagaLocking && !dialect.SupportsSelectForUpdate)
-					throw new InvalidOperationException($"You can't use saga locking for a Dialect {dialect.GetType()} that is not supporting Select For Update");
+				if (useSagaLocking)
+				{
+					if (!dialect.SupportsSelectForUpdate)
+						throw new InvalidOperationException($"You can't use saga locking for a Dialect {dialect.GetType()} that does not supports Select For Update.");
 
+					if (useNoWaitSagaLocking && !dialect.SupportsSelectForWithNoWait)
+						throw new InvalidOperationException($"You can't use saga locking with no-wait for a Dialect {dialect.GetType()} that does not supports no-wait clause.");
+				}
+					
 				using (var command = connection.CreateCommand())
 				{
 					if (sagaDataPropertyPath == idPropertyName)
@@ -651,7 +677,7 @@ namespace Rebus.AdoNet
 							sagaTypeParam,
 							dialect.QuoteForColumnName(SAGA_ID_COLUMN),
 							idParam,
-							useSagaLocking ? dialect.ParameterSelectForUpdate : string.Empty
+							GetSagaLockingClause(dialect)
 						);
 						command.AddParameter(sagaTypeParam, sagaType);
 						command.AddParameter(idParam, id);
@@ -670,14 +696,31 @@ namespace Rebus.AdoNet
 							dialect.QuoteForColumnName(SAGA_TYPE_COLUMN), dialect.EscapeParameter(SAGA_TYPE_COLUMN),
 							dialect.QuoteForColumnName(SAGAINDEX_KEY_COLUMN), dialect.EscapeParameter(SAGAINDEX_KEY_COLUMN),
 							dialect.QuoteForColumnName(SAGAINDEX_VALUE_COLUMN), dialect.EscapeParameter(SAGAINDEX_VALUE_COLUMN),
-							useSagaLocking ? dialect.ParameterSelectForUpdate : string.Empty
+							GetSagaLockingClause(dialect)
 						);
 						command.AddParameter(dialect.EscapeParameter(SAGA_TYPE_COLUMN), sagaType);
 						command.AddParameter(dialect.EscapeParameter(SAGAINDEX_KEY_COLUMN), sagaDataPropertyPath);
 						command.AddParameter(dialect.EscapeParameter(SAGAINDEX_VALUE_COLUMN), (fieldFromMessage ?? "").ToString());
 					}
 
-					var value = (string)command.ExecuteScalar();
+					string value = null;
+
+					try
+					{
+						value = (string)command.ExecuteScalar();
+					}
+					catch (DbException ex)
+					{
+						// When in no-wait saga-locking mode, inspect
+						// exception and rethrow ex as SagaLockedException.
+						if (useSagaLocking && useNoWaitSagaLocking)
+						{
+							if (dialect.IsSelectForNoWaitLockingException(ex))
+								throw new AdoNetSagaLockedException(ex);
+						}
+
+						throw;
+					}
 
 					if (value == null) return null;
 
@@ -780,7 +823,7 @@ namespace Rebus.AdoNet
 
 This is due to a limitation in SQL Server, where compound indexes have a 900 byte upper size limit - and
 since the saga index needs to be able to efficiently query by saga type, key, and value at the same time,
-there's room for only 200 characters as the key, 200 characters as the value, and 40 characters as the
+there's room for only 200 characters as the key, 200 characters as the value, and 80 characters as the
 saga type name.",
 						MaximumSagaDataTypeNameLength));
 			}
